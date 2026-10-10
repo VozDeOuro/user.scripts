@@ -54,8 +54,10 @@ Added (ignored by upstream, so rollback stays safe):
 - `/boot/config/plugins/user.scripts/settings.json` (UI prefs, history cap, `historyDir`, flush
   interval)
 
-Cron migration: on install and on every Apply, lines in `customSchedule.cron` that point to a
-script with no matching `custom` entry in `schedule.json` are imported into `schedule.json`
+Cron migration: on install and on every Apply, upstream-format lines (`startCustom.php <path>`) in
+`customSchedule.cron` that point to a script with no matching `custom` entry in `schedule.json` are
+imported (lines in our generated `run.php` format are never re-imported, so disabling a schedule
+sticks) into `schedule.json`
 (frequency `custom`, cron from the line) before regenerating the file. On Tower this preserves the
 hand-added `web-sites-status` (`* * * * *`) and `cf-dns-sync` (`*/5 * * * *`) entries if they
 are not already in `schedule.json` (Tower currently has 7 custom entries and 7 cron lines; the
@@ -233,7 +235,7 @@ POST, form or JSON body, `csrf_token` checked against `/var/local/emhttp/var.ini
 `{"ok":true,...}` or `{"ok":false,"error":"..."}` with HTTP 4xx.
 
 Actions: `list`, `run`, `background`, `abort`, `log` (id, which=0..5, offset for tail),
-`clearLog`, `downloadLog`, `history` (id, limit), `get` (script body), `save`, `create`, `rename`,
+`clearLog`, `history` (id, limit), `get` (script body), `save`, `create`, `rename`,
 `describe`, `delete`, `schedule.set` (id, frequency, custom, notify, failAfter, remindHours,
 overlap, timeout, hangAfter — validates cron and ranges), `apply` (write schedule + cron),
 `settings.get`, `settings.set`. `run`/`background` return 409 while the script holds its lock.
@@ -251,7 +253,8 @@ overlap, timeout, hangAfter — validates cron and ranges), `apply` (write sched
 - Run options dialog: notifications (off/failure/always, alert after N failures, remind every N h),
   overlap (skip/queue/parallel), timeout, stuck alert after N skips.
 - Log drawer: run selector (current + last 5), live tail every 2 s while running, wrap toggle,
-  download, clear. History tab: table of recent runs.
+  download (client-side from the fetched text, no extra endpoint), clear.
+- Settings dialog: history folder, save interval (15/30/60 min), entries kept per script. History tab: table of recent runs.
 - Edit drawer: ACE editor (bundled), header-variable toggles that write `#key=value` lines at the
   top of the script, Save.
 - Polling `list` every 5 s while the page is visible (pauses on `visibilitychange`).
@@ -284,8 +287,9 @@ overlap, timeout, hangAfter — validates cron and ranges), `apply` (write sched
 - The `.plg` `<CHANGES>` and README state "tested on 7.3.3, should work on 7.0+"; installs on 6.x
   are refused by `min`.
 - `pkg_build.sh` builds `archive/user.scripts-<version>.txz` and prints the md5.
-- GitHub Actions on tag `v*`: run tests, build txz, create release with the txz, commit the
-  updated version + md5 into the `.plg`.
+- `bin/release` builds the txz locally, stamps version + md5 into the `.plg`, tags and creates the
+  GitHub release with that exact file (a CI rebuild would change the md5). GitHub Actions runs the
+  tests on PHP 8.3 and 8.4 on every push and verifies the published asset's md5 matches the `.plg`.
 - Remove `.DS_Store` files and the stray `log.zip`.
 
 ## Testing
