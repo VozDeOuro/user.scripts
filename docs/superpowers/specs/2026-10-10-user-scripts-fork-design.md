@@ -44,9 +44,15 @@ Unchanged and read as-is:
 
 Added (ignored by upstream, so rollback stays safe):
 
-- `schedule.json` entries may carry `notify` (`off` | `failure` | `always`, default `off`).
-- `/boot/config/plugins/user.scripts/history/<dir>.jsonl`
-- `/boot/config/plugins/user.scripts/settings.json` (UI prefs: default sort, history cap)
+- `schedule.json` entries may carry per-script options (all optional, defaults in brackets):
+  `notify` (`off` | `failure` | `always`) [`off`], `failAfter` (consecutive failures before the
+  first alert) [1], `remindHours` (repeat while still failing; 0 = never) [24], `overlap`
+  (`skip` | `queue` | `parallel`) [`skip`], `timeout` (seconds, 0 = none) [0],
+  `hangAfter` (consecutive overlap skips before a "looks stuck" alert) [3].
+- `<historyDir>/<dir>.jsonl` and `<historyDir>/state.json` (see History); `historyDir` defaults to
+  `/boot/config/plugins/user.scripts/history`.
+- `/boot/config/plugins/user.scripts/settings.json` (UI prefs, history cap, `historyDir`, flush
+  interval)
 
 Cron migration: on install and on every Apply, lines in `customSchedule.cron` that point to a
 script with no matching `custom` entry in `schedule.json` are imported into `schedule.json`
@@ -121,18 +127,41 @@ or `run.php --frequency <x>` (runs every script scheduled with that frequency).
 Per run:
 
 1. Resolve script; skip (with a syslog line) if `arrayStarted` and array not started, `noParity`
-   and a parity check/rebuild is running, `foregroundOnly` for non-manual triggers, or the script
-   is already running (no overlapping runs; the skip is logged and recorded in history as
-   `skipped`).
-2. Copy to `/tmp/user.scripts/tmpScripts/<id>/script`, add `#!/bin/bash` if no shebang, strip CR,
+   and a parity check/rebuild is running, or `foregroundOnly` for non-manual triggers.
+2. Overlap guard (see "Overlapping runs" below).
+3. Copy to `/tmp/user.scripts/tmpScripts/<id>/script`, add `#!/bin/bash` if no shebang, strip CR,
    chmod +x (upstream behaviour). `directPHP` scripts keep upstream's path.
-3. Rotate logs: `log.txt` → `log.1.txt` … keep 5. `clearLog` only clears the current log.
-4. Spawn with `setsid` so the script leads its own process group; write pid to
-   `running/<id>`; write `argumentDefault` as arguments.
-5. Wait, capture exit code and duration, append history, remove `running/<id>`, write
+4. Rotate logs: `log.txt` → `log.1.txt` … keep 5. `clearLog` only clears the current log.
+5. Spawn with `setsid` so the script leads its own process group; write pid to
+   `running/<id>`; write `argumentDefault` as arguments. If `timeout` > 0, the Runner aborts the
+   group after that many seconds and records status `timeout`.
+6. Wait, capture exit code and duration, append history, remove `running/<id>`, write
    `finished/<id>`, call Notify.
 
 Abort: `kill -TERM -<pgid>`, wait 5 s, `kill -KILL -<pgid>`; records exit `aborted` (fixes #18).
+
+#### Overlapping runs
+
+The guard is an exclusive `flock` on `/tmp/user.scripts/locks/<id>.lock`, taken by `run.php`
+before spawning and held (inherited fd) until the script's process group exits. A kernel lock is
+released automatically if `run.php` or the script dies, so a crash never leaves a stale "running"
+state the way upstream's pid file can; `running/<id>` is kept only for UI/legacy compatibility and
+is cleaned if its pid is dead.
+
+Per-script `overlap` mode when the lock is held:
+
+- `skip` (default): do not start; record a `skipped` history entry (collapsed, see History) and
+  increment the script's `skips` counter in state. When `skips` reaches `hangAfter` (default 3), send
+  one "looks stuck" notification ("still running since 14:02 (2h 10m), 3 scheduled runs skipped")
+  if `notify` is not `off`. Counter resets when a run starts.
+- `queue`: wait on the lock (`flock` blocking) but at most one waiter: a second non-blocking lock
+  on `<id>.queue` decides who waits; further triggers are skipped. For backups and syncs where a
+  missed run matters.
+- `parallel`: no guard (upstream behaviour), for scripts that are safe to run concurrently.
+
+Manual Run / Background from the UI while the script holds the lock returns HTTP 409 "already
+running" and the buttons are disabled; Abort is shown instead. `timeout` (above) is the fix for
+scripts that hang forever, so `skip` does not silently suppress them for days.
 
 Foreground "Run Script" (live output in a modal) uses the same Runner with trigger `manual`, and
 the UI tails the log instead of upstream's `openBox` iframe, so foreground runs also get history
@@ -140,25 +169,63 @@ and notifications.
 
 ### History (`lib/History.php`)
 
-One JSON object per line in `history/<id>.jsonl`:
+One JSON object per line:
 `{"start":1760065025,"end":1760065031,"exit":0,"trigger":"custom","status":"ok"}`
-`status` ∈ `ok`, `failed`, `aborted`, `skipped`. Capped at 200 lines per script (configurable in
-settings); the cap is applied by rewriting the file when it exceeds cap + 50, so flash writes stay
-rare for every-minute scripts. Writes are atomic (temp file + rename).
+`status` ∈ `ok`, `failed`, `aborted`, `timeout`, `skipped`. Capped at 200 lines per script
+(configurable).
 
-Flash-wear note: an every-minute script produces ~1440 appends/day. To limit wear, history for
-runs with trigger `custom`/`hourly` whose status equals the previous run's status and exit code is
-buffered in `/tmp/user.scripts/history/` and flushed to flash every 15 minutes and on any status
-change. The UI reads flash + buffer merged.
+#### Flash wear
+
+RAM is the live copy, persistent storage is a periodic snapshot.
+
+- Every run writes only to `/tmp/user.scripts/history/<id>.jsonl` and
+  `/tmp/user.scripts/history/state.json` (tmpfs, zero flash wear).
+- Steady-state runs are collapsed: if a run has the same status and exit code as the previous
+  entry, the previous entry gets `"repeat": N, "last": <ts>` updated in place instead of a new line.
+  An every-minute script that keeps succeeding stays one line, and the history still shows
+  "ok ×1440 since 00:00". Durations keep min/avg/max on the collapsed line.
+- A sync job (`run.php --sync-history`, own cron line, default hourly) copies changed RAM files to
+  `historyDir` with temp file + rename, only when their content hash changed since the last sync.
+  It also runs from the `stopping` and `unmounting_disks` emhttp events, so a clean shutdown or
+  array stop loses nothing.
+- Status changes (ok→failed, failed→ok, timeout, aborted) trigger an immediate sync of that one
+  script, because those are the entries worth surviving a power loss.
+- On boot (`disks_mounted` / plugin install) RAM history is seeded from `historyDir`.
+- `historyDir` can be moved off flash to a pool path in settings (e.g.
+  `/mnt/user/system/user.scripts`); if that path is unavailable (array stopped) history stays in
+  RAM and syncs once it appears.
+
+Worst case on Tower (7 custom scripts, 2 every-minute): ~24 small rewrites/day per changed script
+plus status-change writes, versus upstream-style append-per-run ~2900/day. An unclean power loss
+loses at most the last hour of steady-state repeats, never a status change.
 
 ### Notify (`lib/Notify.php`)
 
 - Mode per script from `schedule.json` `notify`: `off` (default), `failure`, `always`.
-- Failure = exit ≠ 0 or aborted. Skipped runs never notify.
-- Calls `/usr/local/emhttp/webGui/scripts/notify -e "User Scripts" -s "<name> failed (exit N)"
-  -d "<trigger>, ran 6s" -m "<last 10 log lines>" -i alert|normal`.
-- Failure notifications for the same script are not repeated while it keeps failing with the same
-  exit code; the next success sends a "recovered" notice (only when mode is `failure` or `always`).
+- Failure = exit ≠ 0, aborted by timeout, or "looks stuck" (overlap). Manual aborts and
+  skipped runs never notify.
+- Calls `/usr/local/emhttp/webGui/scripts/notify -e "User Scripts" -s "<subject>"
+  -d "<detail>" -m "<last 10 log lines>" -i alert|warning|normal`.
+
+#### Repeat failures
+
+Per-script state in `state.json`: `health` (`ok` | `failing`), `fails` (consecutive), `firstFail`,
+`lastExit`, `lastAlert`, `skips`.
+
+| Event | Sends |
+|-------|-------|
+| failure, `fails` < `failAfter` | nothing (absorbs one-off blips; set `failAfter: 3` for every-minute checks) |
+| failure, `fails` reaches `failAfter` | **alert** "<name> failing: exit 1 (3 runs since 14:02)" |
+| further failures, same exit code | nothing |
+| failure with a different exit code | **warning** "<name> now failing with exit 2" (new failure mode) |
+| still failing `remindHours` after `lastAlert` | **warning** reminder "<name> still failing for 1d 2h, 1,440 failed runs" |
+| first success after an alert | **normal** "<name> recovered after 1h 12m (73 failed runs)" |
+| success in `always` mode while healthy | **normal** "<name> finished in 6s" |
+| `skips` reaches `hangAfter` | **warning** "<name> looks stuck: running 2h 10m, 3 runs skipped" (once per stuck run) |
+
+A recovery is only announced if a failure alert was sent, so blips below `failAfter` stay
+silent end to end. State lives in RAM and is synced with history, so a reboot does not re-alert
+an old failure.
 
 ### API (`api.php`)
 
@@ -167,8 +234,9 @@ POST, form or JSON body, `csrf_token` checked against `/var/local/emhttp/var.ini
 
 Actions: `list`, `run`, `background`, `abort`, `log` (id, which=0..5, offset for tail),
 `clearLog`, `downloadLog`, `history` (id, limit), `get` (script body), `save`, `create`, `rename`,
-`describe`, `delete`, `schedule.set` (id, frequency, custom, notify — validates cron), `apply`
-(write schedule + cron), `settings.get`, `settings.set`.
+`describe`, `delete`, `schedule.set` (id, frequency, custom, notify, failAfter, remindHours,
+overlap, timeout, hangAfter — validates cron and ranges), `apply` (write schedule + cron),
+`settings.get`, `settings.set`. `run`/`background` return 409 while the script holds its lock.
 
 ### UI (`Userscripts.page`, `ui/app.js`, `ui/app.css`)
 
@@ -178,8 +246,10 @@ Actions: `list`, `run`, `background`, `abort`, `log` (id, which=0..5, offset for
   button (enabled when schedule edits are pending, as upstream).
 - Script row: status dot + name + description; schedule chip with a human description of the cron
   ("every 5 minutes", "Mon at 03:00") and next run; last run (relative time, duration, status
-  pill); actions: Run, Background, Abort (only while running), Log, ⋯ menu (Edit, Rename,
-  Description, Notifications, Delete).
+  pill, "ok ×1440" for collapsed repeats, "failing since 14:02" badge); actions: Run, Background,
+  Abort (only while running), Log, ⋯ menu (Edit, Rename, Description, Run options, Delete).
+- Run options dialog: notifications (off/failure/always, alert after N failures, remind every N h),
+  overlap (skip/queue/parallel), timeout, stuck alert after N skips.
 - Log drawer: run selector (current + last 5), live tail every 2 s while running, wrap toggle,
   download, clear. History tab: table of recent runs.
 - Edit drawer: ACE editor (bundled), header-variable toggles that write `#key=value` lines at the
@@ -199,8 +269,20 @@ Actions: `list`, `run`, `background`, `abort`, `log` (id, which=0..5, offset for
 
 - Public fork `VozDeOuro/user.scripts`, branch `master`, upstream remote kept.
 - `.plg`: `author` "Andrew Zawadzki, VozDeOuro", `github` "VozDeOuro/user.scripts", version
-  `YYYY.MM.DD` (newer than upstream's 2025.06.21), `min="7.0.0"`, `pluginURL` on raw.githubusercontent.
+  `YYYY.MM.DD` (newer than upstream's 2025.06.21), `pluginURL` on raw.githubusercontent.
   Package `.txz` downloaded from the GitHub release for that version, md5 checked.
+
+#### Unraid version support
+
+- Developed and tested on Unraid 7.3.3 (PHP 8.4); declared `min="7.0.0"`.
+- Code limited to PHP 8.3 syntax and functions (Unraid 7.0 ships PHP 8.3); CI runs PHPUnit on both
+  `php:8.3-cli` and `php:8.4-cli`.
+- Only tools present on 7.0 are used: `flock`, `setsid`, `update_cron`, `notify`, emhttp events
+  `disks_mounted`, `stopping`, `stopping_svcs`, `unmounting_disks`.
+- UI relies on Unraid's theme CSS variables where present, with fallbacks defined in `ui/app.css`
+  so 7.0–7.2 themes that lack a variable still render correctly.
+- The `.plg` `<CHANGES>` and README state "tested on 7.3.3, should work on 7.0+"; installs on 6.x
+  are refused by `min`.
 - `pkg_build.sh` builds `archive/user.scripts-<version>.txz` and prints the md5.
 - GitHub Actions on tag `v*`: run tests, build txz, create release with the txz, commit the
   updated version + md5 into the `.plg`.
@@ -211,10 +293,13 @@ Actions: `list`, `run`, `background`, `abort`, `log` (id, which=0..5, offset for
 - PHPUnit (run in CI and locally via Docker `php:8.3-cli`): header parsing (empty/missing/CRLF),
   `resolve()` rejects `..`, `/`, unknown ids; `validCron` accept/reject table incl. names and
   #19's malformed line; cron generation + migration (fixture = Tower's current
-  `customSchedule.cron` + `schedule.json`); `nextRun`; history append/cap/buffer flush; notify
-  dedupe logic (notify binary stubbed).
+  `customSchedule.cron` + `schedule.json`); `nextRun`; history append/cap, collapse of repeats,
+  RAM→disk sync only on hash change, seed on boot; notify state machine table above (notify binary
+  stubbed), including failAfter, new exit code, reminder and recovery.
 - Runner integration test (bash, in CI container): script that spawns `sleep 300` child → abort
-  kills both; exit code captured; overlapping run skipped.
+  kills both; exit code captured; overlap `skip` records skipped and fires stuck alert at
+  `hangAfter`; `queue` runs exactly one waiter; `parallel` runs both; lock released after the
+  runner is `kill -9`ed; `timeout` kills the group and records `timeout`.
 - Playwright smoke test against Tower after install: page loads with no console errors, all
   scripts listed, controls visible at 1600px and 390px widths, open log drawer, run a harmless
   test script and see status go running → ok.
